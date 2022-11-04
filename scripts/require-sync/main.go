@@ -55,7 +55,12 @@ func main() {
 func checkTemplates(libraryPath string) error {
 	system := os.DirFS(libraryPath)
 
-	err := fs.WalkDir(system, ".", func(path string, d fs.DirEntry, err error) error {
+	rc, err := newRefChecker()
+	if err != nil {
+		return fmt.Errorf("creating referentialChecker: %w", err)
+	}
+
+	err = fs.WalkDir(system, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -68,14 +73,17 @@ func checkTemplates(libraryPath string) error {
 			return nil
 		}
 
+		// we'll use this in error messages
 		absolutePath := filepath.Join(libraryPath, path)
 
+		// read template
 		tmpl, err := gator.ReadTemplate(scheme, system, path)
 		if err != nil {
 			return fmt.Errorf("reading template: %w", err)
 		}
 
-		isRef, err := isReferential(tmpl)
+		// check if it's referential
+		isRef, err := rc.isReferential(tmpl)
 		if err != nil {
 			return fmt.Errorf("detecting referential: %w", err)
 		}
@@ -114,17 +122,34 @@ func checkTemplates(libraryPath string) error {
 	return err
 }
 
-func isReferential(ct *templates.ConstraintTemplate) (bool, error) {
-	nonRefClient, err := opaClient(false)
+type referentialChecker struct {
+	refClient    *opa.Client
+	nonRefClient *opa.Client
+}
+
+func newRefChecker() (*referentialChecker, error) {
+	refClient, err := opaClient(true)
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("creating referential client: %w", err)
 	}
 
+	nonRefClient, err := opaClient(false)
+	if err != nil {
+		return nil, fmt.Errorf("creating non-referential client: %w", err)
+	}
+
+	return &referentialChecker{
+		refClient:    refClient,
+		nonRefClient: nonRefClient,
+	}, nil
+}
+
+func (rc *referentialChecker) isReferential(ct *templates.ConstraintTemplate) (bool, error) {
 	// a referential template will fail when added to a client that does not
 	// have the `inventory` field enabled.  Trying to add the template to the
 	// non-referential client thus serves as an indication of it being
 	// referential.
-	_, err = nonRefClient.AddTemplate(context.Background(), ct)
+	_, err := rc.nonRefClient.AddTemplate(context.Background(), ct)
 	if err == nil {
 		// successfully added template to non-referential client.  Template is
 		// non-referential.
@@ -132,13 +157,7 @@ func isReferential(ct *templates.ConstraintTemplate) (bool, error) {
 	} else if strings.Contains(err.Error(), "check refs failed on module") {
 		// referential data is required.  i.e. we have a referential template
 
-		// do a sanity check that we can add the template to a referential
-		// client
-		refClient, err := opaClient(true)
-		if err != nil {
-			return false, err
-		}
-		if _, err := refClient.AddTemplate(context.Background(), ct); err != nil {
+		if _, err := rc.refClient.AddTemplate(context.Background(), ct); err != nil {
 			return false, fmt.Errorf("adding template to referential client: %w", err)
 		}
 		return true, nil
@@ -154,13 +173,6 @@ func opaClient(referential bool) (*opa.Client, error) {
 	}
 
 	driver, err := local.New(local.Tracing(false), externs)
-	if err != nil {
-		return nil, fmt.Errorf("creating driver: %w", err)
-	}
-
-	if referential {
-		driver, err = local.New(local.Tracing(false), local.Externs("inventory"))
-	}
 	if err != nil {
 		return nil, fmt.Errorf("creating driver: %w", err)
 	}
