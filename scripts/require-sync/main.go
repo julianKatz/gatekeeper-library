@@ -15,8 +15,11 @@ import (
 	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/local"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	gkapis "github.com/open-policy-agent/gatekeeper/apis"
+	"github.com/open-policy-agent/gatekeeper/pkg/gator"
 	"github.com/open-policy-agent/gatekeeper/pkg/target"
-	"gopkg.in/yaml.v3"
 )
 
 const syncAnnotation string = "metadata.gatekeeper.sh/requiresSyncData"
@@ -26,12 +29,22 @@ var (
 	fileFlag = flag.Bool("sync_file", false, "When `true`, require a `sync.yaml` file for each referential template.")
 )
 
+var scheme *runtime.Scheme
+
+func init() {
+	scheme = runtime.NewScheme()
+	err := gkapis.AddToScheme(scheme)
+	if err != nil {
+		panic(fmt.Errorf("adding gatekeeper apis to scheme: %w", err))
+	}
+}
+
 func main() {
 	flag.Parse()
 	if *pathFlag == "" {
 		log.Fatal("Missing `path` flag")
 	}
-	log.Println("Verifying path:", *pathFlag)
+	log.Printf("Verifying path: %s\n", *pathFlag)
 
 	err := checkTemplates(*pathFlag)
 	if err != nil {
@@ -40,100 +53,68 @@ func main() {
 }
 
 func checkTemplates(libraryPath string) error {
-	err := filepath.WalkDir(libraryPath, func(path string, d fs.DirEntry, err error) error {
+	system := os.DirFS(libraryPath)
+
+	err := fs.WalkDir(system, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() {
+
+		if d.IsDir() {
 			return nil
 		}
 
-		_, error := os.Stat(filepath.Join(path, "template.yaml"))
-		if !os.IsNotExist(error) {
-			// Unmarshall template
-			krm, err := unMarshall(filepath.Join(path, "template.yaml"))
-			if err != nil {
-				return err
+		if d.Name() != "template.yaml" {
+			return nil
+		}
+
+		absolutePath := filepath.Join(libraryPath, path)
+
+		tmpl, err := gator.ReadTemplate(scheme, system, path)
+		if err != nil {
+			return fmt.Errorf("reading template: %w", err)
+		}
+
+		isRef, err := isReferential(tmpl)
+		if err != nil {
+			return fmt.Errorf("detecting referential: %w", err)
+		}
+
+		// nothing to check for non referential templates
+		if !isRef {
+			return nil
+		}
+
+		log.Printf("Referential template: %s\n", absolutePath)
+
+		// verify our annotation is present
+		if _, ok := tmpl.GetAnnotations()[syncAnnotation]; !ok {
+			return fmt.Errorf("template at path '%s' is missing annotation with key '%s'", absolutePath, syncAnnotation)
+		}
+
+		// verify that the sync object is present in the same directory as the template
+		if !*fileFlag {
+			return nil
+		}
+
+		syncPath := filepath.Join(filepath.Dir(path), "sync.yaml")
+		_, err = fs.Stat(system, syncPath)
+
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("`sync.yaml` not found in dir '%s'", filepath.Dir(absolutePath))
 			}
 
-			// Check if Template is Referential
-			isRef, err := isReferential(krm.ConstraintTemplate)
-			if err != nil {
-				return fmt.Errorf("detecting referential: %w", err)
-			}
-			if isRef {
-				// Get template name
-				templateName, err := getTemplateName(krm.ConstraintTemplate)
-				if err != nil {
-					return err
-				}
-				log.Println(fmt.Errorf("Found Referential Template: %s", templateName))
-
-				// Check if annotation is present
-				hasAnno, err := hasAnnotation(krm.Metadata.Annotations, syncAnnotation)
-				if err != nil {
-					return err
-				}
-				if !hasAnno {
-					return fmt.Errorf("Error: `%s` annotation not found for %s", syncAnnotation, templateName)
-				}
-
-				// Check sync.yaml is present
-				_, err = os.Stat(filepath.Join(path, "sync.yaml"))
-				if os.IsNotExist(err) && *fileFlag {
-					return fmt.Errorf("Error: `sync.yaml` not found for %s", templateName)
-				}
-			}
+			return fmt.Errorf("stat on '%s': %w", syncPath, err)
 		}
 
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return nil
-}
 
-type KRM struct {
-	ConstraintTemplate *templates.ConstraintTemplate
-	// TODO: Annotations are not queryable in templates.ConstraintTemplate/ObjectMeta
-	Metadata struct {
-		Annotations map[string]string `json:"annotations,omitempty"`
-	} `json:"metadata,omitempty"`
-}
-
-func unMarshall(templatePath string) (*KRM, error) {
-	// read the template into memory
-	var ct *KRM
-	f, err := os.ReadFile(templatePath)
-	if err != nil {
-		return nil, fmt.Errorf("reading file: %w", err)
-	}
-	err = yaml.Unmarshal(f, &ct)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshalling Annotations: %w", err)
-	}
-	err = yaml.Unmarshal(f, &ct.ConstraintTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshalling ConstraintTemplate: %w", err)
-	}
-	return ct, nil
-}
-
-func hasAnnotation(annotations map[string]string, annotation string) (bool, error) {
-	if _, exists := annotations[annotation]; exists {
-		return true, nil
-	}
-	return false, nil
-}
-
-func getTemplateName(ct *templates.ConstraintTemplate) (string, error) {
-	return ct.Spec.CRD.Spec.Names.Kind, nil
+	return err
 }
 
 func isReferential(ct *templates.ConstraintTemplate) (bool, error) {
-	ct.SetName(strings.ToLower(ct.Spec.CRD.Spec.Names.Kind))
-
 	nonRefClient, err := opaClient(false)
 	if err != nil {
 		return false, err
