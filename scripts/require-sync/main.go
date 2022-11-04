@@ -145,25 +145,32 @@ func newRefChecker() (*referentialChecker, error) {
 }
 
 func (rc *referentialChecker) isReferential(ct *templates.ConstraintTemplate) (bool, error) {
+	// Verify that we can add the template to a referential client.  This is a sanity
+	// check for a malformed template.
+	if _, err := rc.refClient.AddTemplate(context.Background(), ct); err != nil {
+		return false, fmt.Errorf("adding template to referential client: %w", err)
+	}
+
 	// a referential template will fail when added to a client that does not
 	// have the `inventory` field enabled.  Trying to add the template to the
 	// non-referential client thus serves as an indication of it being
 	// referential.
 	_, err := rc.nonRefClient.AddTemplate(context.Background(), ct)
 	if err == nil {
-		// successfully added template to non-referential client.  Template is
-		// non-referential.
+		// no error, template isn't referential
 		return false, nil
-	} else if strings.Contains(err.Error(), "check refs failed on module") {
-		// referential data is required.  i.e. we have a referential template
-
-		if _, err := rc.refClient.AddTemplate(context.Background(), ct); err != nil {
-			return false, fmt.Errorf("adding template to referential client: %w", err)
-		}
-		return true, nil
-	} else {
-		return false, fmt.Errorf("adding template to client: %v", err)
 	}
+
+	// we got the specific error message that means referential
+	if errTextIsReferential(err) {
+		return true, nil
+	}
+
+	return false, fmt.Errorf("unrelated error when adding template to non-referential client: %w", err)
+}
+
+func errTextIsReferential(err error) bool {
+	return strings.Contains(err.Error(), "check refs failed on module")
 }
 
 func opaClient(referential bool) (*opa.Client, error) {
